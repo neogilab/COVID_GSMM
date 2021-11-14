@@ -1,0 +1,403 @@
+
+### COVID network fusion using mRNA and metabolomics data
+#### Loading packages
+```{r, message=FALSE}
+library(NMF)
+library(MultiAssayExperiment)
+library(MOFA)
+library(MOFAdata)
+library(readxl)
+library(tidyverse)
+library(ggalluvial)
+library(ggpubr)
+library(caret)
+library(MLmetrics)
+library(openxlsx)
+library(survival)
+library(survminer)
+library(ggbiplot)
+```
+#### Method: SNF
+#### Source: Wang, Bo, et al. "Similarity network fusion for aggregating data types on a genomic scale." Nature methods 11.3 (2014): 333.
+#### 1. Data preparation
+```{r}
+# Loading data
+df_mrna <- read_excel("../data/Complete.xlsx", sheet = 4) # Transcriptomics  rows:columns -> genes:samples
+df_meta <- read_excel("../data/Complete.xlsx", sheet = 3) # Metabolomics_transpose   rows:columns -> genes:samples
+metadata <- read_excel("../data/Complete.xlsx", sheet = 1) # Clinical data
+
+# Pre-processing
+##1. Filtering out the lowly expressed genes:
+df_mrna <- as.data.frame(df_mrna)
+rownames(df_mrna) <- df_mrna$Symbol
+df_mrna <- df_mrna[,-1]
+df_mrna <- df_mrna %>% mutate(mean_all = rowMeans(.)) %>% filter(!(mean_all<5)) %>% select(!mean_all)
+##2. formatting
+df_meta <- as.data.frame(df_meta)
+rownames(df_meta) <- df_meta$Metabolites
+df_meta <- df_meta[,-1]
+# Filtering the variance less than 0.01
+df_com <- rbind(df_meta, df_mrna)
+df_com_f <- df_com[rowVars(as.matrix(df_com)) > 0.01,]
+# Extracting the ID and Group columns
+metadata <- as.data.frame(metadata %>% select(`KI ID`, Group) %>%
+                            filter(`KI ID` %in% colnames(df_com)))
+rownames(metadata) <- metadata$`KI ID`
+#write.xlsx(metadata, file = '../data/metadata.xlsx')
+```
+#### 2. Create list consisting of mRNA and metabolomics
+```{r}
+# Combine two different datasets
+data_mix<- list()
+data_mix[[1]] <- t(as.matrix( df_com_f %>% filter(rownames(df_com_f) %in% rownames(df_mrna))))
+data_mix[[2]] <-  t(as.matrix(df_com_f %>% filter(!(rownames(df_com_f) %in% rownames(df_mrna)))))
+names(data_mix) <- c("mRNA","Metabolomics")
+#save(data_mix, file = "../data/data_mix.Rdata")
+```
+#### 3. Load functions (downloaded from the paper)
+```{r}
+source('../Literature/SNFtool/R/affinityMatrix.R')
+source('../Literature/SNFtool/R/dist2.R')
+source('../Literature/SNFtool/R/Cal_NMI.R')
+source('../Literature/SNFtool/R/chiDist2.R')
+source('../Literature/SNFtool/R/Concordance_Network_NMI.R')
+source('../Literature/SNFtool/R/Cs_prediction.r')
+source('../Literature/SNFtool/R/discretisation.r')
+source('../Literature/SNFtool/R/discretisationEigenVectorData.r')
+source('../Literature/SNFtool/R/displayClusters.r')
+source('../Literature/SNFtool/R/dominateset.R')
+source('../Literature/SNFtool/R/group_predict.r')
+source('../Literature/SNFtool/R/SNF.R')
+source('../Literature/SNFtool/R/SpectralClustering.r')
+source('../Literature/SNFtool/R/Standard_Normalization.R')
+```
+#### 4.Get the best parameters for clustering
+```{r}
+T = 20 # number of iterations of SNF
+load('../data/data_mix.Rdata')
+data_mix = lapply(data_mix, Standard_Normalization)
+data_mix = lapply(data_mix, function(x) dist2(x, x))
+metadata <- read_excel("../data/Complete.xlsx", sheet = 1) # Clinical data
+metadata = as.data.frame(metadata)
+rownames(metadata) = metadata$`KI ID`
+
+res = matrix(1:66, nrow = 11, ncol = 6)
+res_accuracy = matrix(1:66, nrow = 11, ncol = 6)
+#res_f1 = matrix(1:66, nrow = 11, ncol = 6)
+
+for(i in 1:11){
+  K = i + 4
+  for(J in 1:6){
+    alpha = J*0.1+0.2
+    affinityL = lapply(data_mix, function(x) affinityMatrix(x, K, alpha))
+    W = SNF(affinityL, K, T)
+    # Define the number of cluster
+    clustering = SpectralClustering(W,3)
+    # Calculate SNFMI
+    rownames(W) = rownames(affinityL[[1]])
+    colnames(W) = colnames(affinityL[[1]])
+    metadata_new = metadata[colnames(W),]
+    SNFNMI = Cal_NMI(clustering, metadata_new$Group)
+    res[i,J] = SNFNMI
+    # Calculate accuracy
+    rownames(metadata) = metadata$`KI ID`
+    label = as.numeric(metadata[rownames(data_mix[[1]]),]$Group)
+    method = TRUE
+    # Create the training and test data
+    flds <- createFolds(label, k = 5, list = TRUE, returnTrain = T)
+    accuracy_res =0
+    #f1_res = 0
+    for(fold in 1:5){
+      n = floor(length(unlist(flds[fold])))
+      trainSample = unlist(flds[fold])
+      train = lapply(data_mix, function(x) x[trainSample, ])
+      test = lapply(data_mix, function(x) x[-trainSample, ]) 
+      groups = label[trainSample]
+      newLabel = group_predict(train,test,groups,K,alpha,T,method)
+      accuracy = sum(label[-trainSample] == newLabel[-c(1:n)])/(length(label) - n)
+      
+      if(accuracy >accuracy_res){
+        accuracy_res = accuracy
+      }
+    }
+    res_accuracy[i, J] = accuracy_res
+  }
+}
+rownames = list()
+for(i in 1:11){
+  rownames = append(rownames,paste0(i+4))
+}
+colnames = list()
+for(j in 1:6){
+  alpha = j*0.1+0.2
+  colnames = append(colnames,paste0(alpha))
+}
+
+rownames(res) = rownames
+colnames(res) = colnames
+
+rownames(res_accuracy) = rownames
+colnames(res_accuracy) = colnames
+
+res_reshape <- as.data.frame(res) %>% mutate(K = rownames(res)) %>% gather("alpha","SNFNMI",-K)
+res_reshape$K <- factor(res_reshape$K, levels = unique(res_reshape$K))
+p <- 
+  ggplot(data=res_reshape, aes(x=K, y=SNFNMI, group=alpha)) +
+  geom_line(aes(color=alpha))+
+  geom_point()
+ggsave(p, filename = "../Figures/Clustering3_ven_parameterSelect_SNFNMI_v1.pdf", width = 8, height = 6)
+
+res_accuracy_reshape <- as.data.frame(res_accuracy) %>% mutate(K = rownames(res_accuracy)) %>% gather("alpha","Accuracy",-K)
+res_accuracy_reshape$K <- factor(res_accuracy_reshape$K, levels = unique(res_accuracy_reshape$K))
+p <- 
+  ggplot(data=res_accuracy_reshape, aes(x=K, y=Accuracy, group=alpha)) +
+  geom_line(aes(color=alpha))+
+  geom_point()
+ggsave(p, filename = "../Figures/Clustering3_ven_parameterSelect_Accuracy_v1.pdf", width = 8, height = 6)
+
+res = as.data.frame(res)
+res_accuracy = as.data.frame(res_accuracy)
+
+res$K = rownames(res)
+res_accuracy$K = rownames(res_accuracy)
+
+list_of_datasets = list("NMI" = res,
+                        "Accuracy" = res_accuracy)
+write.xlsx(list_of_datasets, file = "../Figures/Clustering3_parameters_select_v1.xlsx")
+```
+
+#### 5. Calculate patients similarity metrices
+```{r}
+################################################################################
+# How to use PNF with multiple views
+K = 6 # number of neighbours
+alpha = 0.7 # hyperparameter in affinityMatrix
+T = 20 # number of iterations of SNF
+# Normalize the features in each of the views.
+load('../data/data_mix.Rdata')
+metadata <- read_excel("../data/Complete.xlsx", sheet = 1) # Clinical data
+data_mix = lapply(data_mix, Standard_Normalization)
+# Calculate the distances for each view
+data_mix = lapply(data_mix, function(x) dist2(x, x))
+# Construct the similarity graphs
+affinityL = lapply(data_mix, function(x) affinityMatrix(x, K, alpha))
+# Construct the fused network
+W = SNF(affinityL, K, T)
+clustering = SpectralClustering(W,4)
+rownames(W) = rownames(affinityL[[1]])
+colnames(W) = colnames(affinityL[[1]])
+metadata = as.data.frame(metadata)
+rownames(metadata) = metadata$`KI ID`
+metadata_new = metadata[colnames(W),]
+SNFNMI = Cal_NMI(clustering, metadata_new$Group)
+SNFNMI
+```
+#### 6. Visualization of fused patients similarity matrices
+```{r}
+# Patients similarity fusion:
+displayClusters(W,clustering)
+new_cluster = data.frame(ID = colnames(W), Cluster = clustering)
+metadata_com = merge(metadata, new_cluster, by.x = "KI ID", by.y = 'ID')
+mode(metadata_com$Cluster) = 'character'
+#mode(metadata_com$Group_new) = 'character'
+rownames(metadata_com) = metadata_com$`KI ID`
+a = metadata_com %>% select(Group_new, Cluster)
+
+my.colors <- c(colorRampPalette(colors = c("#f7f7f7", "#67a9cf"))(10),
+               colorRampPalette(colors = c("#67a9cf","#2166ac"))(200))
+
+my_anno_colors = list(
+    Group_new = c( 'Healthy' = "#48690E", 'Severe' = "#FFA500", 'Mild' = "#FFD700", 'Conv' = "#8BB443"),
+    Cluster = c('1' = "#8dd3c7", '2' = "#fb8072", '3' = "#bebada", '4' = '#666666')
+)
+
+### W: 14.72, H:12.65
+pheatmap(W,
+         cluster_cols = T,
+         cluster_rows = T,
+         show_colnames = F,
+         color =  my.colors, 
+         fontsize_number = 15,
+         fontsize = 8,
+         cellwidth = 10,
+         cellheight = 10,
+         annotation_row = a,
+         annotation_colors = my_anno_colors,
+         border_color = FALSE)
+```
+
+#### 7. Visualization of individual patients similarity matrics
+#### 7.1 mRNA
+```{r}
+load('../data/data_mix.Rdata')
+data_mix = lapply(data_mix, Standard_Normalization)
+data_mix = lapply(data_mix, function(x) dist2(x, x))
+
+###next, construct similarity graphs
+W1 = affinityMatrix(data_mix[[1]], K, alpha)
+W2 = affinityMatrix(data_mix[[2]], K, alpha)
+
+truelabel = as.numeric(metadata[colnames(W1),]$Group)
+```
+
+
+#### 7.1 mRNA
+```{r}
+## These similarity graphs have complementary information about clusters.
+displayClusters(W1,truelabel);
+my.colors <- c(colorRampPalette(colors = c("#f7f7f7", "#d1e5f0"))(10),
+               colorRampPalette(colors = c("#d1e5f0","#67a9cf"))(200))
+
+my_anno_colors = list(
+    Group_new = c( 'Healthy' = "#48690E", 'Severe' = "#FFA500", 'Mild' = "#FFD700", 'Conv' = "#8BB443")
+)
+
+b = metadata_new %>% select(Group_new)
+### W: 14.72, H:12.65
+pheatmap(W1,
+         cluster_cols = T,
+         cluster_rows = T,
+         show_colnames = F,
+         color =  my.colors, 
+         fontsize_number = 15,
+         fontsize = 8,
+         cellwidth = 10,
+         cellheight = 10,
+         annotation_row = b,
+         annotation_colors = my_anno_colors,
+         border_color = FALSE)
+```
+
+
+#### 7.2 Metabolomics
+```{r}
+displayClusters(W2,truelabel);
+
+my.colors <- c(colorRampPalette(colors = c("#f7f7f7", "#d1e5f0"))(30),
+               colorRampPalette(colors = c("#d1e5f0","#67a9cf"))(255))
+
+my_anno_colors = list(
+    Group_new = c( 'Healthy' = "#48690E", 'Severe' = "#FFA500", 'Mild' = "#FFD700", 'Conv' = "#8BB443")
+)
+
+### W: 12.90, H:12.65
+pheatmap(W2,
+         cluster_cols = T,
+         cluster_rows = T,
+         show_colnames = F,
+         color =  my.colors, 
+         fontsize_number = 15,
+         fontsize = 8,
+         cellwidth = 10,
+         cellheight = 10,
+         annotation_row = b,
+         annotation_colors = my_anno_colors,
+         border_color = FALSE)
+```
+
+
+#### 8. Mapping the true groups with clusters generated by SNF
+```{r}
+pre_cluster <- data.frame(cluster = clustering)
+pre_cluster$name <- rownames(W)
+metadata <- merge(metadata, pre_cluster, by.x = "KI ID", by.y = "name")
+metadata <- metadata %>% mutate(group_new = case_when(Group == "0" ~ "Healthy", Group == "1" ~ "Severe",
+                                                    Group == "2" ~ "Mild", Group == "3" ~"Conv"))
+p <-
+  ggplot(metadata,
+       aes(axis1 = group_new, axis2 = cluster)) +
+  geom_alluvium(aes(fill = group_new), width = 1/12) +
+  geom_stratum(width = 1/12, aes(fill = group_new), color = "#4d4d4d") + theme_bw() +
+  scale_fill_manual(values=c("#8BB443","#48690E","#FFD700","#FFA500")) +
+  theme(axis.text.x = element_blank()) + rremove("x.ticks") + 
+  ylab("Number of samples") + labs(fill = "Group") +
+    theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.background = element_rect(colour = "black", size=0.5, fill=NA),
+        panel.border = element_rect(size = 0.2, colour = "grey"))
+
+ggsave(p, filename = "../Figures/Clustering4_venK6alpha0.7_0909.pdf", width = 4.5, height = 3)
+```
+
+### 11. umap analysis for RNA-seq data (BMI, Age) (update: 2021.09.02)
+```{r}
+res_dir = "../Figures/"
+clusterinfo <- read_excel('../Results/Cluster_info_include_clustering345.xlsx', sheet = 2)
+clinicalData <- read_excel('../data/ClinicalData.xlsx', sheet = 1)
+metadata <- merge(clusterinfo, clinicalData, by.x = 'KI ID', by.y = "ID") 
+rownames(metadata) = metadata$`KI ID`
+load('../data/data_mix.Rdata')
+RNA_data = data_mix[[1]]
+RNA_data = RNA_data[metadata$`KI ID`,]
+
+custom.config = umap.defaults
+custom.config$random_state = 123
+
+#umap_results <- umap::umap(RNA_data)
+umap_results <- umap::umap(RNA_data, config=custom.config) 
+
+metadata = metadata %>% mutate(new_BMI = case_when((BMI < 18.5) ~ "Underweight", (BMI <25 & BMI >18.5) ~ "HealthyWeight",
+                                                   (BMI <30 & BMI >25) ~ "OverWeight", BMI > 30 ~ "Obesity"))
+umap_plot_df <- data.frame(umap_results$layout) %>%
+  tibble::rownames_to_column("KI ID") %>%
+  dplyr::inner_join(metadata, by = "KI ID")
+#umap_plot_df = umap_plot_df %>% filter(!is.na(BMI))
+
+g <- ggplot(umap_plot_df, aes(X1, X2, color = as.factor(cluster))) + geom_point(size = 3.5) + theme_bw() +
+    theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.background = element_rect(colour = "black", size=0.5, fill=NA),
+        panel.border = element_blank(),
+        legend.title = element_blank()) +
+  theme(plot.title =element_text(size=15, face="bold", hjust=0.5, colour = "blue"),
+        axis.title = element_text(size = 10)) +
+  labs(x = "UMAP1", y = "UMAP2") + 
+  #scale_color_manual(values = c("#8BB443","#48690E","#FFD700","#FFA500")) # Group
+  #scale_color_manual(values = c("#bc4b51","#5b8e7d")) # Gender
+  scale_color_manual(values = c("#8dd3c7","#fb8072","#bebada","#666666")) # Cluster
+  #scale_color_manual(values = c("#d19c1d","#7d451b")) #Comorbidities
+  #scale_color_manual(values = c("#90be6d","#ea9010","#37371f")) #new_BMI
+
+ggsave(g, filename = paste0(res_dir,"UMAP_RNA_newCluster_v3.pdf"), width = 4.2, height = 3,device=cairo_pdf)
+```
+### 11. umap analysis for metabolomics (BMI, Age) (update: 2021.09.06)
+```{r}
+res_dir = "../Figures/"
+clusterinfo <- read_excel('../Results/Cluster_info_include_clustering345.xlsx', sheet = 2)
+clinicalData <- read_excel('../data/ClinicalData.xlsx', sheet = 1)
+metadata <- merge(clusterinfo, clinicalData, by.x = 'KI ID', by.y = "ID") 
+rownames(metadata) = metadata$`KI ID`
+load('../data/data_mix.Rdata')
+RNA_data = data_mix[[2]]
+RNA_data = RNA_data[metadata$`KI ID`,]
+
+custom.config = umap.defaults
+custom.config$random_state = 123
+
+#umap_results <- umap::umap(RNA_data)
+umap_results <- umap::umap(RNA_data, config=custom.config) 
+
+metadata = metadata %>% mutate(new_BMI = case_when((BMI < 18.5) ~ "Underweight", (BMI <25 & BMI >18.5) ~ "HealthyWeight",
+                                                   (BMI <30 & BMI >25) ~ "OverWeight", BMI > 30 ~ "Obesity"))
+umap_plot_df <- data.frame(umap_results$layout) %>%
+  tibble::rownames_to_column("KI ID") %>%
+  dplyr::inner_join(metadata, by = "KI ID")
+#umap_plot_df = umap_plot_df %>% filter(!is.na(BMI))
+
+g <- ggplot(umap_plot_df, aes(X1, X2, color = as.factor(cluster))) + geom_point(size = 3.5) + theme_bw() +
+    theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.background = element_rect(colour = "black", size=0.5, fill=NA),
+        panel.border = element_blank(),
+        legend.title = element_blank()) +
+  theme(plot.title =element_text(size=15, face="bold", hjust=0.5, colour = "blue"),
+        axis.title = element_text(size = 10)) +
+  labs(x = "UMAP1", y = "UMAP2") + 
+  #scale_color_manual(values = c("#8BB443","#48690E","#FFD700","#FFA500")) # Group
+  #scale_color_manual(values = c("#bc4b51","#5b8e7d")) # Gender
+  scale_color_manual(values = c("#8dd3c7","#fb8072","#bebada","#666666")) # Cluster
+  #scale_color_manual(values = c("#d19c1d","#7d451b")) #Comorbidities
+  #scale_color_manual(values = c("#90be6d","#ea9010","#37371f")) #new_BMI
+
+ggsave(g, filename = paste0(res_dir,"UMAP_metabolomics_newCluster_v3.pdf"), width = 4.2, height = 3,device=cairo_pdf)
+```
