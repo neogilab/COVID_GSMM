@@ -1,4 +1,4 @@
-
+#Load packages
 
 library(DESeq2)
 count=read.delim("/home/anoop/Desktop/COVID_Omics/Transcriptomics/DiffExp/Deseq/HC-Conv/Input.txt",row.names = 1, check.names = FALSE)
